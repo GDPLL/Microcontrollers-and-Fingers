@@ -19,8 +19,8 @@
 // ========== 采样参数 ==========
 #define SAMPLE_RATE_HZ 2000                             // 采样频率 2000Hz
 #define SAMPLE_INTERVAL_US (1000000 / SAMPLE_RATE_HZ)   // 500微秒
-#define WINDOW_MS 100                                   // 窗口长度 100ms
-#define WINDOW_SIZE (SAMPLE_RATE_HZ * WINDOW_MS / 1000) // 200
+#define WINDOW_MS 50                                    // 窗口长度 50ms（缩短以降低 RMS 平滑延迟）
+#define WINDOW_SIZE (SAMPLE_RATE_HZ * WINDOW_MS / 1000) // 100
 
 // ========== 全局变量 ==========
 // 关键参数
@@ -49,6 +49,10 @@ int currentAngle = 90;
 int targetAngle = 90;
 const int SMOOTH_STEP = 2; // 平滑步长（度/更新）
 
+// 归一化增益：去直流后 RMS/峰值 受肌电波峰因数影响约在 0.2~0.5，
+// 满行程不足时调大此值（若重新校准并把 max 采为最大收缩的 RMS，可让其接近 1.0）
+#define NORM_GAIN 2.0f
+
 // 滑动窗口缓冲区
 float buffer1[WINDOW_SIZE];
 float buffer2[WINDOW_SIZE];
@@ -58,7 +62,7 @@ bool windowReady = false;
 // 时间控制
 unsigned long lastSampleTime = 0;
 unsigned long lastControlTime = 0;
-const unsigned long CONTROL_INTERVAL_MS = 20; // 舵机更新周期20ms
+const unsigned long CONTROL_INTERVAL_MS = 10; // 舵机/控制更新周期10ms
 
 // LDA 预测函数
 int lda_predict(float *feat)
@@ -231,17 +235,26 @@ void computeControl()
     if (!calibrated)
         return;
 
-    // 数据处理
+    // 数据处理：先去直流 rest 再算 RMS。
+    // 原实现直接对原始 ADC（直流偏置约 rest≈2048）求 RMS 再减 rest，
+    // 结果近似 ac_rms²/(2·rest)，是幅度的二次项——小发力时几乎不变，
+    // 表现为"发力后指头反应慢、要很用力才有反应"。
     float rms1 = 0, rms2 = 0;
-    for (int i = 0; i < WINDOW_SIZE; i++) // 从滑动窗口用RMS处理
+    for (int i = 0; i < WINDOW_SIZE; i++) // 去直流后求 RMS
     {
-        rms1 += buffer1[i] * buffer1[i];
-        rms2 += buffer2[i] * buffer2[i];
+        float x1 = buffer1[i] - rest1;
+        float x2 = buffer2[i] - rest2;
+        rms1 += x1 * x1;
+        rms2 += x2 * x2;
     }
     rms1 = sqrt(rms1 / WINDOW_SIZE);
     rms2 = sqrt(rms2 / WINDOW_SIZE);
-    float norm1 = constrain((float)(rms1 - rest1) / (max1 - rest1), 0.0f, 1.0f); // 归一化计算发力比
-    float norm2 = constrain((float)(rms2 - rest2) / (max2 - rest2), 0.0f, 1.0f);
+
+    // 归一化：分母为校准时的交流幅度，配合 NORM_GAIN 补偿波峰因数
+    float range1 = (max1 > rest1) ? (float)(max1 - rest1) : 1.0f;
+    float range2 = (max2 > rest2) ? (float)(max2 - rest2) : 1.0f;
+    float norm1 = constrain(NORM_GAIN * rms1 / range1, 0.0f, 1.0f);
+    float norm2 = constrain(NORM_GAIN * rms2 / range2, 0.0f, 1.0f);
 
     // 计算目标舵机角度
     int angle = 90;
@@ -264,7 +277,7 @@ void computeControl()
     { // 手势模式（LDA）
         float feat[LDA_N_FEATURES] = {rms1, rms2};
         int gesture = lda_predict(feat);
-        Serial.printf("Gesture: %d\n, gesture");
+        Serial.printf("Gesture: %d\n", gesture);
         // 根据手势映射角度（根据你的模型类别调整）
         switch (gesture)
         {
@@ -385,15 +398,16 @@ void loop()
     // 串口指令
     handleSerial();
 
-    // 高速采样（2000Hz）
-    unsigned long nowUs = micros(); // 获取当前时间
-    if (nowUs - lastSampleTime >= SAMPLE_INTERVAL_US)
+    // 高速采样（2000Hz）：用 while 追赶，保证平均采样率恒为 2000Hz。
+    // 原实现每轮 loop 只采一个点，末尾的 delay(1) 会把实际采样率砍半到 ~1kHz，
+    // 使 200 点窗口实际覆盖 200ms（而非 100ms），这是延迟的主要来源之一。
+    while ((micros() - lastSampleTime) >= SAMPLE_INTERVAL_US)
     {
-        lastSampleTime = nowUs;
+        lastSampleTime += SAMPLE_INTERVAL_US;
         sampling(); // 采样逻辑
     }
 
-    // 每20ms执行一次控制（舵机更新、特征提取、推理）
+    // 每10ms执行一次控制（舵机更新、特征提取、推理）
     if (windowReady && (millis() - lastControlTime >= CONTROL_INTERVAL_MS))
     {
         lastControlTime = millis();
@@ -427,6 +441,4 @@ void loop()
                  mode, currentAngle, targetAngle, rms1, rms2);
         sendBLEMessage(bleBuf);
     }
-    // 短暂延迟，让出CPU
-    delay(1);
 }

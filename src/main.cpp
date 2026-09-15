@@ -14,13 +14,34 @@
 #define EMG_PIN1 4  // 肌电通道1
 #define EMG_PIN2 5  // 肌电通道2
 #define SERVO_PIN 6 // 舵机信号线
-#define BTN_BOOT 0  // 板载BOOT按钮（低电平有效）
+#define BTN_BOOT 0  // 板载BOOT按钮
 
 // ========== 采样参数 ==========
 #define SAMPLE_RATE_HZ 2000                             // 采样频率 2000Hz
 #define SAMPLE_INTERVAL_US (1000000 / SAMPLE_RATE_HZ)   // 500微秒
-#define WINDOW_MS 50                                    // 窗口长度 50ms（缩短以降低 RMS 平滑延迟）
+#define WINDOW_MS 50                                    // 窗口长度 50ms
 #define WINDOW_SIZE (SAMPLE_RATE_HZ * WINDOW_MS / 1000) // 100
+
+// ========== 串口日志（USB CDC + UART0 双通道） ==========
+// ESP32-S3 开发板通常有两个 USB 口：
+//   1) 原生 USB 口（USB-Serial-JTAG）：本工程 ARDUINO_USB_CDC_ON_BOOT=1，Serial 走这里
+//   2) UART 调试口（CP2102/CH340 桥接，GPIO43/44）：对应 Serial0
+// 日志同时输出、命令同时接收，避免"接错口 + 命令没反应"的问题。
+#define ENABLE_SERIAL_ECHO 1 // 回显收到的每个命令，便于确认输入到底有没有进芯片
+
+#define LOGLN(x)           \
+    do                     \
+    {                      \
+        Serial.println(x); \
+        Serial0.println(x);\
+    } while (0)
+
+#define LOGF(...)                     \
+    do                                \
+    {                                 \
+        Serial.printf(__VA_ARGS__);   \
+        Serial0.printf(__VA_ARGS__);  \
+    } while (0)
 
 // ========== 全局变量 ==========
 // 关键参数
@@ -42,6 +63,7 @@ const unsigned long BLE_SEND_INTERVAL_MS = 100; // 每100ms发一次
 
 // 控制模式: 0=比例, 1=阈值, 2=手势
 int mode = 0;
+int lastGesture = -1; // 最近一次 LDA 手势，用于调试打印
 
 // 舵机参数
 Servo servo; // 舵机类
@@ -49,8 +71,7 @@ int currentAngle = 90;
 int targetAngle = 90;
 const int SMOOTH_STEP = 2; // 平滑步长（度/更新）
 
-// 归一化增益：去直流后 RMS/峰值 受肌电波峰因数影响约在 0.2~0.5，
-// 满行程不足时调大此值（若重新校准并把 max 采为最大收缩的 RMS，可让其接近 1.0）
+// 归一化调整值
 #define NORM_GAIN 2.0f
 
 // 滑动窗口缓冲区
@@ -103,12 +124,12 @@ class MyServerCallbacks : public BLEServerCallbacks
     void onConnect(BLEServer *pServer)
     {
         deviceConnected = true;
-        Serial.println("✅ BLE 设备已连接");
+        LOGLN("BLE connected");
     };
     void onDisconnect(BLEServer *pServer)
     {
         deviceConnected = false;
-        Serial.println("❌ BLE 设备已断开，重新广播...");
+        LOGLN("BLE disconnected, re-advertising...");
         pServer->startAdvertising();
     }
 };
@@ -116,10 +137,10 @@ class MyServerCallbacks : public BLEServerCallbacks
 // 肌电采集与永久写入程序（>阻塞程序，误差大 >添加完成事件到前端）
 void calibrate()
 {
-    Serial.println("\n=== CALIBRATION ===");
+    LOGLN("\n=== CALIBRATION ===");
 
     // 放松采集
-    Serial.println("1. Relax muscles, then press BOOT button");
+    LOGLN("1. Relax muscles, then press BOOT button");
     while (digitalRead(BTN_BOOT) == HIGH)
         delay(10); // 获取板载按钮电平，等待开始
     delay(200);
@@ -132,10 +153,10 @@ void calibrate()
     }
     rest1 = sum1 / 100;
     rest2 = sum2 / 100;
-    Serial.printf("Rest values: CH1=%d, CH2=%d\n", rest1, rest2);
+    LOGF("Rest values: CH1=%d, CH2=%d\n", rest1, rest2);
 
     // 收缩肌肉1采集最大值
-    Serial.println("2. Contract muscle 1 (e.g., flex wrist), then press BOOT");
+    LOGLN("2. Contract muscle 1 (e.g., flex wrist), then press BOOT");
     while (digitalRead(BTN_BOOT) == HIGH)
         delay(10);
     delay(200);
@@ -147,10 +168,10 @@ void calibrate()
             max1 = v;
         delay(5);
     }
-    Serial.printf("Max CH1: %d\n", max1);
+    LOGF("Max CH1: %d\n", max1);
 
     // 收缩肌肉2采集最大值
-    Serial.println("3. Contract muscle 2 (e.g., extend wrist), then press BOOT");
+    LOGLN("3. Contract muscle 2 (e.g., extend wrist), then press BOOT");
     while (digitalRead(BTN_BOOT) == HIGH)
         delay(10);
     delay(200);
@@ -162,7 +183,7 @@ void calibrate()
             max2 = v;
         delay(5);
     }
-    Serial.printf("Max CH2: %d\n", max2);
+    LOGF("Max CH2: %d\n", max2);
 
     // 写入数据
     calibrated = true;
@@ -174,7 +195,7 @@ void calibrate()
     EEPROM.put(16, calibrated);
     EEPROM.commit();
     EEPROM.end();
-    Serial.println("Calibration saved.");
+    LOGLN("Calibration saved.");
 }
 
 // 读取永久数据
@@ -189,7 +210,7 @@ void loadCalibration()
     EEPROM.end();
     if (calibrated)
     {
-        Serial.printf("Loaded calibration: rest(%d,%d) max(%d,%d)\n", rest1, rest2, max1, max2);
+        LOGF("Loaded calibration: rest(%d,%d) max(%d,%d)\n", rest1, rest2, max1, max2);
     }
 }
 
@@ -276,10 +297,9 @@ void computeControl()
     else if (mode == 2)
     { // 手势模式（LDA）
         float feat[LDA_N_FEATURES] = {rms1, rms2};
-        int gesture = lda_predict(feat);
-        Serial.printf("Gesture: %d\n", gesture);
-        // 根据手势映射角度（根据你的模型类别调整）
-        switch (gesture)
+        lastGesture = lda_predict(feat);
+        // 根据手势映射角度
+        switch (lastGesture)
         {
         case 0:
             angle = 90;
@@ -302,7 +322,10 @@ void computeControl()
     if (millis() - lastPrint > 100)
     {
         lastPrint = millis();
-        Serial.printf("RMS:%.1f %.1f  Norm:%.2f %.2f  Angle:%d\n", rms1, rms2, norm1, norm2, targetAngle);
+        if (mode == 2)
+            LOGF("RMS:%.1f %.1f  Norm:%.2f %.2f  Gesture:%d  Angle:%d\n", rms1, rms2, norm1, norm2, lastGesture, targetAngle);
+        else
+            LOGF("RMS:%.1f %.1f  Norm:%.2f %.2f  Angle:%d\n", rms1, rms2, norm1, norm2, targetAngle);
     }
 }
 
@@ -321,12 +344,28 @@ void sampling()
     }
 }
 
-// 串口调试指令
-void handleSerial()
+// 命令帮助
+void printHelp()
 {
-    if (!Serial.available())
-        return;
-    char c = tolower(Serial.read());
+    LOGLN("-------- Serial commands --------");
+    LOGLN("  c : calibrate (press BOOT at each step)");
+    LOGLN("  m : switch mode (0=PROP 1=THRESH 2=GESTURE)");
+    LOGLN("  0 : servo 0 deg (flex)");
+    LOGLN("  5 : servo 90 deg (center)");
+    LOGLN("  9 : servo 180 deg (extend)");
+    LOGLN("  r : back to rest (90 deg)");
+    LOGLN("  s : emergency stop (hold current position)");
+    LOGLN("  d : dump calibration values");
+    LOGLN("  h : this help");
+    LOGLN("---------------------------------");
+}
+
+// 执行单条命令
+void execCommand(char c)
+{
+#if ENABLE_SERIAL_ECHO
+    LOGF(">> %c\n", c); // 回显：如果这里没输出，说明输入根本没进芯片（多半是监视器开在另一个 USB 口）
+#endif
     switch (c)
     {
     case 'c':
@@ -334,35 +373,75 @@ void handleSerial()
         break;
     case 'm':
         mode = (mode + 1) % 3;
-        Serial.printf("Mode: %s\n", mode == 0 ? "PROPORTIONAL" : (mode == 1 ? "THRESHOLD" : "GESTURE"));
+        LOGF("Mode: %s\n", mode == 0 ? "PROPORTIONAL" : (mode == 1 ? "THRESHOLD" : "GESTURE"));
         break;
     case '0':
         setServoAngle(0);
-        Serial.println("Manual 0°");
+        LOGLN("Manual 0 deg");
         break;
     case '5':
         setServoAngle(90);
-        Serial.println("Manual 90°");
+        LOGLN("Manual 90 deg");
         break;
     case '9':
         setServoAngle(180);
-        Serial.println("Manual 180°");
+        LOGLN("Manual 180 deg");
+        break;
+    case 'r':
+        setServoAngle(90);
+        LOGLN("Manual 90 deg (rest)");
+        break;
+    case 's':
+        targetAngle = currentAngle; // 急停：停在当前位置
+        LOGLN("EMERGENCY STOP (hold current position)");
         break;
     case 'd':
-        Serial.printf("Rest: %d %d, Max: %d %d, Calibrated: %d\n", rest1, rest2, max1, max2, calibrated);
+        LOGF("Rest: %d %d, Max: %d %d, Calibrated: %d\n", rest1, rest2, max1, max2, calibrated);
+        break;
+    case 'h':
+        printHelp();
+        break;
+    default:
+        LOGF("Unknown command '%c' (press h for help)\n", c);
         break;
     }
-    while (Serial.available())
-        Serial.read();
+}
+
+// 取走某个串口上所有待处理字符。
+// 原实现"读 1 个字符后 while(available) read() 清空缓存"，
+// 一次到达多个字符时后面的命令会被直接丢掉，这里改为全部逐个处理。
+void pollCommands(Stream &s)
+{
+    while (s.available() > 0)
+    {
+        int v = s.read();
+        if (v < 0)
+            break;
+        char c = (char)tolower(v);
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t')
+            continue; // 忽略换行/空格（不同终端行尾可能是 \r、\n 或 \r\n）
+        execCommand(c);
+    }
+}
+
+// 串口调试指令：USB CDC(Serial) 与 UART0(Serial0) 两个口同时监听
+void handleSerial()
+{
+    pollCommands(Serial);
+    pollCommands(Serial0);
 }
 
 // ========== 初始化 ==========
 void setup()
 {
     // 硬件初始化
-    Serial.begin(115200); // 波特
+    Serial.begin(115200);  // USB CDC（ESP32-S3 原生 USB 口）
+    Serial0.begin(115200); // UART0（GPIO43/44，板载 USB 转串口芯片那一侧）
+#if ARDUINO_USB_CDC_ON_BOOT
+    Serial.setTxTimeoutMs(0);   // 主机没打开 USB 串口时 CDC 写入会阻塞，置 0 表示不等待，避免拖慢 loop
+#endif
     delay(2000);
-    Serial.println("\n2-Channel EMG Gesture Control with LDA");
+    LOGLN("\n2-Channel EMG Gesture Control with LDA");
     pinMode(EMG_PIN1, INPUT); // 初始化输入
     pinMode(EMG_PIN2, INPUT);
     pinMode(BTN_BOOT, INPUT_PULLUP);
@@ -371,9 +450,10 @@ void setup()
     currentAngle = 90;
     targetAngle = 90;
     loadCalibration(); // 读取数据
-    Serial.println("Commands: c=calibrate, m=mode, 0/5/9=manual, d=debug");
-    Serial.println("Mode 0=PROP, 1=THRESH, 2=GESTURE (LDA)");
+    printHelp();
+    LOGLN("Mode 0=PROP, 1=THRESH, 2=GESTURE (LDA)");
 
+    
     // 初始化 BLE
     BLEDevice::init("ESP32_Bridge");                             // 启动 BLE，命名与 Python 代码中的 ESP32_NAME 一致
     pServer = BLEDevice::createServer();                         // 启用 BLE 服务器
@@ -389,7 +469,10 @@ void setup()
     pAdvertising->addServiceUUID(SERVICE_UUID); //添加服务到广播
     pAdvertising->setScanResponse(true);        //启用响应包
     BLEDevice::startAdvertising();              //启用广播
-    Serial.println("✅ BLE 初始化完成，等待连接...");
+    LOGLN("BLE advertising...");
+    // 看到下面这行说明 setup() 已跑完、可以正常接收串口命令
+    LOGLN(">> Ready. Serial commands on USB CDC + UART0 (type h + Enter for help).");
+    Serial.flush();
 }
 
 // ========== 主循环 ==========
@@ -398,34 +481,30 @@ void loop()
     // 串口指令
     handleSerial();
 
-    // 高速采样（2000Hz）：用 while 追赶，保证平均采样率恒为 2000Hz。
-    // 原实现每轮 loop 只采一个点，末尾的 delay(1) 会把实际采样率砍半到 ~1kHz，
-    // 使 200 点窗口实际覆盖 200ms（而非 100ms），这是延迟的主要来源之一。
+    // 高速采样2000Hz
     while ((micros() - lastSampleTime) >= SAMPLE_INTERVAL_US)
     {
         lastSampleTime += SAMPLE_INTERVAL_US;
         sampling(); // 采样逻辑
     }
 
-    // 每10ms执行一次控制（舵机更新、特征提取、推理）
+    // 中央控制 10ms
     if (windowReady && (millis() - lastControlTime >= CONTROL_INTERVAL_MS))
     {
         lastControlTime = millis();
         computeControl(); // 中央逻辑
     }
 
-    // 舵机平滑更新（高频，无延迟）
+    // 舵机平滑更新
     updateServo();
-    // ===== BLE 数据定时发送（每 100ms） =====
+
+
+    //  BLE 数据定时发送100ms
     if (deviceConnected && (millis() - lastBLESendTime >= BLE_SEND_INTERVAL_MS))
     {
         lastBLESendTime = millis();
 
-        // 获取最新的 RMS 值（需从 computeControl 中提取，这里我们重新计算一次，但为了效率，可以在 computeControl 中保存全局变量）
-        // 方法1：在 computeControl 中计算 rms1, rms2 后存入全局变量，这里直接使用
-        // 方法2：临时重新计算（会消耗一点时间，但窗口数据还在，可以接受）
-        // 这里采用方法1，需要新增几个全局变量：float lastRms1, lastRms2; 并在 computeControl 中赋值。
-        // 下面给出采用方法2的示例（简单但稍耗CPU）
+        // 获取最新的 RMS 值重新计算一次
         float rms1 = 0, rms2 = 0;
         for (int i = 0; i < WINDOW_SIZE; i++)
         {
@@ -437,7 +516,7 @@ void loop()
 
         // 格式: M=模式 C=当前角度 T=目标角度 A=静息1 B=静息2
         char bleBuf[64];
-        snprintf(bleBuf, sizeof(bleBuf), "M%dC%dT%dA%fB%.1f",
+        snprintf(bleBuf, sizeof(bleBuf), "M%dC%dT%dA%.1fB%.1f",
                  mode, currentAngle, targetAngle, rms1, rms2);
         sendBLEMessage(bleBuf);
     }

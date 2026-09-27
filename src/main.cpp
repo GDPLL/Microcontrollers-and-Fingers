@@ -5,6 +5,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <Preferences.h>
 
 #include "lda_model.h"
 #include <iostream>
@@ -52,9 +53,13 @@ bool calibrated = false;
 // ===== BLE =====
 #define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+#define MODEL_CHAR_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // 模型通道
+#define CMD_CHAR_UUID "6E400004-B5A3-F393-E0A9-E50E24DCCA9E"   // 指令通道
 
-BLEServer *pServer = NULL;                   // BLE服务器
-BLECharacteristic *pTxCharacteristic = NULL; // 全局参数特征
+BLEServer *pServer = NULL;                      // BLE服务器
+BLECharacteristic *pTxCharacteristic = NULL;    // 全局参数特征
+BLECharacteristic *pModelCharacteristic = NULL; // 模型通道特征
+BLECharacteristic *pCmdCharacteristic = NULL;   // 指令通道特征
 bool deviceConnected = false;
 
 // BLE 发送定时器
@@ -85,6 +90,23 @@ unsigned long lastSampleTime = 0;
 unsigned long lastControlTime = 0;
 const unsigned long CONTROL_INTERVAL_MS = 10; // 舵机/控制更新周期10ms
 
+// ===== LDA 系数（NVS 可覆盖编译期默认值） =====
+#define LDA_NVS_NS "lda"          // NVS 命名空间
+#define LDA_NVS_KEY "blob"        // 模型键名
+#define LDA_BLOB_MAGIC "LDA1"     // 模型标记
+#define LDA_DISC_COUNT LDA_N_CLASSES       // 判别函数个数
+#define LDA_BLOB_SIZE (6 + LDA_DISC_COUNT * LDA_N_FEATURES * 4 + LDA_DISC_COUNT * 4 + LDA_N_FEATURES * 8)
+#define MODEL_END_MARK "__MODEL_END__" // 模型结束标记
+#define MODEL_BUF_SIZE 512             // 模型分片缓冲上限
+
+float ldaCoef[LDA_DISC_COUNT][LDA_N_FEATURES]; // 判别系数
+float ldaIntercept[LDA_DISC_COUNT];            // 判别常数
+float featMean[LDA_N_FEATURES];                // 特征均值
+float featStd[LDA_N_FEATURES];                 // 特征标准差
+
+uint8_t modelBuf[MODEL_BUF_SIZE]; // 模型分片缓冲
+size_t modelLen = 0;              // 已收字节数
+
 // LDA 预测函数
 int lda_predict(float *feat)
 {
@@ -92,22 +114,22 @@ int lda_predict(float *feat)
     float normFeat[LDA_N_FEATURES];
     for (int i = 0; i < LDA_N_FEATURES; i++)
     {
-        normFeat[i] = (feat[i] - FEATURE_MEAN[i]) / FEATURE_STD[i];
+        normFeat[i] = (feat[i] - featMean[i]) / featStd[i];
     }
     // 计算判别函数值
-    float scores[LDA_N_CLASSES - 1];
-    for (int i = 0; i < LDA_N_CLASSES - 1; i++)
+    float scores[LDA_DISC_COUNT];
+    for (int i = 0; i < LDA_DISC_COUNT; i++)
     {
-        scores[i] = LDA_INTERCEPT[i];
+        scores[i] = ldaIntercept[i];
         for (int j = 0; j < LDA_N_FEATURES; j++)
         {
-            scores[i] += normFeat[j] * LDA_COEF[i][j];
+            scores[i] += normFeat[j] * ldaCoef[i][j];
         }
     }
     // 取最大分数对应的类别
     int pred = 0;
     float maxScore = scores[0];
-    for (int i = 1; i < LDA_N_CLASSES - 1; i++)
+    for (int i = 1; i < LDA_DISC_COUNT; i++)
     {
         if (scores[i] > maxScore)
         {
@@ -225,6 +247,156 @@ void sendBLEMessage(const String &msg)
         // Serial.println("📤 BLE: " + msg);
     }
 }
+
+// 校验并解包 LDA 模型，校验失败返回 false
+bool unpackLdaBlob(const uint8_t *blob, size_t len)
+{
+    if (len != LDA_BLOB_SIZE)
+    {
+        LOGF("main.cpp|unpackLdaBlob|模型长度错误:%u\n", (unsigned)len);
+        return false;
+    }
+    if (memcmp(blob, LDA_BLOB_MAGIC, 4) != 0)
+    {
+        LOGLN("main.cpp|unpackLdaBlob|模型标记错误");
+        return false;
+    }
+    if (blob[4] != LDA_N_FEATURES || blob[5] != LDA_DISC_COUNT)
+    {
+        LOGF("main.cpp|unpackLdaBlob|模型维度不符:%u %u\n", blob[4], blob[5]);
+        return false;
+    }
+    size_t off = 6;
+    memcpy(ldaCoef, blob + off, sizeof(ldaCoef));
+    off += sizeof(ldaCoef);
+    memcpy(ldaIntercept, blob + off, sizeof(ldaIntercept));
+    off += sizeof(ldaIntercept);
+    memcpy(featMean, blob + off, sizeof(featMean));
+    off += sizeof(featMean);
+    memcpy(featStd, blob + off, sizeof(featStd));
+    return true;
+}
+
+// 载入 LDA 系数，NVS 有有效模型则覆盖编译期默认值
+void loadLdaModel()
+{
+    for (int i = 0; i < LDA_DISC_COUNT; i++)
+    {
+        ldaIntercept[i] = LDA_INTERCEPT[i];
+        for (int j = 0; j < LDA_N_FEATURES; j++)
+            ldaCoef[i][j] = LDA_COEF[i][j];
+    }
+    for (int j = 0; j < LDA_N_FEATURES; j++)
+    {
+        featMean[j] = FEATURE_MEAN[j];
+        featStd[j] = FEATURE_STD[j];
+    }
+
+    Preferences prefs;
+    prefs.begin(LDA_NVS_NS, true);
+    size_t n = prefs.getBytesLength(LDA_NVS_KEY);
+    if (n == 0)
+    {
+        prefs.end();
+        LOGLN("LDA model: header defaults");
+        return;
+    }
+    uint8_t blob[LDA_BLOB_SIZE];
+    n = prefs.getBytes(LDA_NVS_KEY, blob, sizeof(blob));
+    prefs.end();
+    if (!unpackLdaBlob(blob, n))
+        return;
+    LOGF("LDA model: NVS %u bytes\n", (unsigned)n);
+}
+
+// 落地 LDA 模型并立即生效
+void applyLdaModel(const uint8_t *blob, size_t len)
+{
+    modelLen = 0; // 无论成败都清空缓冲，避免残包累积
+    if (!unpackLdaBlob(blob, len))
+        return;
+
+    Preferences prefs;
+    prefs.begin(LDA_NVS_NS, false);
+    prefs.putBytes(LDA_NVS_KEY, blob, len);
+    prefs.end();
+
+    LOGF("LDA model applied, %u bytes\n", (unsigned)len);
+    sendBLEMessage("ACK:MODEL:OK");
+}
+
+// 切换控制模式，0比例 1阈值 2手势
+void setMode(int m)
+{
+    if (m < 0 || m > 2)
+    {
+        LOGF("main.cpp|setMode|模式越界:%d\n", m);
+        return;
+    }
+    mode = m;
+    lastGesture = -1;
+    LOGF("Mode: %s\n", mode == 0 ? "PROPORTIONAL" : (mode == 1 ? "THRESHOLD" : "GESTURE"));
+}
+
+// 解析指令通道文本命令
+void handleBleCommand(const String &cmd)
+{
+    if (cmd.startsWith("CMD:MODE:"))
+    {
+        setMode(cmd.substring(9).toInt());
+        sendBLEMessage("ACK:MODE:" + String(mode));
+        return;
+    }
+    LOGF("main.cpp|handleBleCommand|未知命令:%s\n", cmd.c_str());
+}
+
+// 指令通道写入回调
+class CmdWriteCallbacks : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *pChar)
+    {
+        String cmd = String(pChar->getValue().c_str());
+        cmd.trim();
+        if (cmd.length() == 0)
+        {
+            LOGLN("main.cpp|CmdWriteCallbacks|收到空指令");
+            return;
+        }
+        handleBleCommand(cmd);
+    }
+};
+
+// 模型通道写入回调，分片累积到结束标记后落地
+class ModelWriteCallbacks : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *pChar)
+    {
+        std::string chunk = pChar->getValue();
+        if (chunk.empty())
+        {
+            LOGLN("main.cpp|ModelWriteCallbacks|收到空分片");
+            return;
+        }
+        if (chunk == MODEL_END_MARK)
+        {
+            if (modelLen == 0)
+            {
+                LOGLN("main.cpp|ModelWriteCallbacks|模型数据为空");
+                return;
+            }
+            applyLdaModel(modelBuf, modelLen);
+            return;
+        }
+        if (modelLen + chunk.size() > MODEL_BUF_SIZE)
+        {
+            LOGF("main.cpp|ModelWriteCallbacks|模型超长:%u\n", (unsigned)(modelLen + chunk.size()));
+            modelLen = 0;
+            return;
+        }
+        memcpy(modelBuf + modelLen, chunk.data(), chunk.size());
+        modelLen += chunk.size();
+    }
+};
 
 // 安全设置目标角度
 void setServoAngle(int angle)
@@ -372,8 +544,7 @@ void execCommand(char c)
         calibrate();
         break;
     case 'm':
-        mode = (mode + 1) % 3;
-        LOGF("Mode: %s\n", mode == 0 ? "PROPORTIONAL" : (mode == 1 ? "THRESHOLD" : "GESTURE"));
+        setMode((mode + 1) % 3);
         break;
     case '0':
         setServoAngle(0);
@@ -450,6 +621,7 @@ void setup()
     currentAngle = 90;
     targetAngle = 90;
     loadCalibration(); // 读取数据
+    loadLdaModel();    // 读取 LDA 系数
     printHelp();
     LOGLN("Mode 0=PROP, 1=THRESH, 2=GESTURE (LDA)");
 
@@ -464,6 +636,16 @@ void setup()
         BLECharacteristic::PROPERTY_NOTIFY |
             BLECharacteristic::PROPERTY_READ);       // 创建新特征
     pTxCharacteristic->addDescriptor(new BLE2902()); // 数据流描述符
+    pModelCharacteristic = pService->createCharacteristic(
+        MODEL_CHAR_UUID,
+        BLECharacteristic::PROPERTY_WRITE |
+            BLECharacteristic::PROPERTY_WRITE_NR);      // 模型通道
+    pModelCharacteristic->setCallbacks(new ModelWriteCallbacks());
+    pCmdCharacteristic = pService->createCharacteristic(
+        CMD_CHAR_UUID,
+        BLECharacteristic::PROPERTY_WRITE |
+            BLECharacteristic::PROPERTY_WRITE_NR);      // 指令通道
+    pCmdCharacteristic->setCallbacks(new CmdWriteCallbacks());
     pService->start();
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising(); // 获取广播
     pAdvertising->addServiceUUID(SERVICE_UUID); //添加服务到广播
